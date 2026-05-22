@@ -1,5 +1,5 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.0.0/firebase-app.js";
-import { getDatabase, ref, set, onValue, update, remove, get } from "https://www.gstatic.com/firebasejs/10.0.0/firebase-database.js";
+import { getDatabase, ref, set, onValue, update, remove, get, runTransaction } from "https://www.gstatic.com/firebasejs/10.0.0/firebase-database.js";
 import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.0.0/firebase-auth.js";
 
 // [주의] 실제 API 키로 교체하세요!
@@ -21,20 +21,75 @@ const DB_ROOT = 'blackandwhite';
 
 let myUid, myNickname, currentRoom;
 let myScore = 0;
-let mySubmittedNumber = null;
+let mySubmittedNumber = 0;
+let currentStatus = 'setup';
+let latestRoomData = null;
+let isJudging = false;
+let isStartingNextRound = false;
+let finishHandled = false;
+let lastEffectKey = '';
 
 // 1. 초기 타일 덱 생성 (1~9)
 function createMyDeck() {
     const deckEl = document.getElementById('my-deck');
     deckEl.innerHTML = '';
+
+    const row1 = document.createElement('div');
+    row1.className = 'deck-row';
+
+    const row2 = document.createElement('div');
+    row2.className = 'deck-row';
+
     for (let i = 1; i <= 9; i++) {
         const tile = document.createElement('div');
         tile.className = `deck-tile ${i % 2 === 0 ? 'black' : 'white'}`;
         tile.innerText = i;
         tile.dataset.num = i;
         tile.onclick = () => submitTile(i, tile);
-        deckEl.appendChild(tile);
+
+        if (i <= 5) {
+            row1.appendChild(tile);
+        } else {
+            row2.appendChild(tile);
+        }
     }
+
+    deckEl.appendChild(row1);
+    deckEl.appendChild(row2);
+}
+
+function syncDeckUsedTiles(player) {
+    const usedTiles = player && player.usedTiles ? player.usedTiles : {};
+
+    document.querySelectorAll('.deck-tile').forEach(tile => {
+        const num = Number(tile.dataset.num);
+        if (usedTiles[num]) {
+            tile.classList.add('used');
+        } else {
+            tile.classList.remove('used');
+        }
+    });
+}
+
+function renderTile(tileEl, num, hideNumber = false) {
+    const safeNum = Number(num || 0);
+
+    if (safeNum > 0) {
+        tileEl.className = `tile ${safeNum % 2 === 0 ? 'black' : 'white'}`;
+        tileEl.innerText = hideNumber ? '?' : safeNum;
+    } else {
+        tileEl.className = 'tile unknown';
+        tileEl.innerText = '?';
+    }
+}
+
+function hasSubmitted(player) {
+    return Number(player && player.submittedTile ? player.submittedTile : 0) > 0;
+}
+
+function getUsedTileCount(player) {
+    if (!player || !player.usedTiles) return 0;
+    return Object.keys(player.usedTiles).length;
 }
 
 // 2. 랜덤 코드 방 생성 및 참여 로직
@@ -51,7 +106,7 @@ async function enterGame(roomCode, isCreating) {
             if (roomData) return alert("이미 존재하는 방 코드입니다. 다시 시도하세요.");
         } else {
             if (!roomData) return alert("존재하지 않는 입장 코드입니다.");
-            if (roomData.status === 'playing' || roomData.status === 'result') return alert("⚠️ 이미 진행 중인 게임입니다.");
+            if (['playing', 'result', 'judging', 'starting', 'finished'].includes(roomData.status)) return alert("⚠️ 이미 진행 중인 게임입니다.");
             const playerCount = roomData.players ? Object.keys(roomData.players).length : 0;
             if (playerCount >= 2) return alert("🚫 방이 가득 찼습니다.");
         }
@@ -63,18 +118,31 @@ async function enterGame(roomCode, isCreating) {
         await set(ref(db, `${DB_ROOT}/${currentRoom}/players/${myUid}`), {
             nickname: myNickname,
             score: 0,
-            submittedTile: null,
-            isReady: false
+            submittedTile: 0,
+            isReady: false,
+            usedTiles: {}
         });
 
         if (isCreating) {
-            await set(ref(db, `${DB_ROOT}/${currentRoom}/status`), 'setup');
+            await update(ref(db, `${DB_ROOT}/${currentRoom}`), {
+                status: 'setup',
+                createdAt: Date.now()
+            });
         }
 
         document.getElementById('auth-screen').classList.add('hidden');
         document.getElementById('game-screen').classList.remove('hidden');
         document.getElementById('display-room').innerText = `코드: ${currentRoom}`;
         document.getElementById('display-name').innerText = myNickname;
+
+        myScore = 0;
+        mySubmittedNumber = 0;
+        currentStatus = 'setup';
+        latestRoomData = null;
+        isJudging = false;
+        isStartingNextRound = false;
+        finishHandled = false;
+        lastEffectKey = '';
         
         createMyDeck();
         listenToRoom();
@@ -108,43 +176,82 @@ document.getElementById('join-room-btn').onclick = () => {
 
 // 3. 타일 제출 로직
 async function submitTile(num, tileEl) {
-    if (mySubmittedNumber !== null) return;
+    if (currentStatus !== 'playing') {
+        alert("아직 타일을 낼 수 없습니다.");
+        return;
+    }
+
+    if (mySubmittedNumber > 0) return;
+
+    const myPlayer = latestRoomData && latestRoomData.players ? latestRoomData.players[myUid] : null;
+    if (myPlayer && myPlayer.usedTiles && myPlayer.usedTiles[num]) {
+        alert("이미 사용한 타일입니다.");
+        return;
+    }
     
     tileEl.classList.add('used');
     mySubmittedNumber = num;
 
     const myPlayedEl = document.getElementById('my-played-tile');
-    myPlayedEl.className = `tile ${num % 2 === 0 ? 'black' : 'white'}`;
-    myPlayedEl.innerText = num;
+    renderTile(myPlayedEl, num);
     document.getElementById('game-info').innerText = "상대방의 선택을 기다리는 중...";
 
-    await update(ref(db, `${DB_ROOT}/${currentRoom}/players/${myUid}`), {
-        submittedTile: num
-    });
-
-    checkRoundReady();
+    try {
+        await update(ref(db, `${DB_ROOT}/${currentRoom}/players/${myUid}`), {
+            submittedTile: num,
+            [`usedTiles/${num}`]: true
+        });
+    } catch (error) {
+        console.error("타일 제출 실패:", error);
+        tileEl.classList.remove('used');
+        mySubmittedNumber = 0;
+        renderTile(myPlayedEl, 0);
+        alert("타일 제출에 실패했습니다. 다시 시도하세요.");
+    }
 }
 
-async function checkRoundReady() {
-    const snapshot = await get(ref(db, `${DB_ROOT}/${currentRoom}/players`));
-    const players = snapshot.val();
-    const pIds = Object.keys(players);
-    
-    if (pIds.length === 2 && players[pIds[0]].submittedTile !== null && players[pIds[1]].submittedTile !== null) {
-        if (pIds[0] === myUid) {
-            judgeRound(players, pIds);
+async function tryStartFirstRound(data, pIds) {
+    if (data.status === 'setup' && pIds.length === 2) {
+        await update(ref(db, `${DB_ROOT}/${currentRoom}`), { status: 'playing' });
+    }
+}
+
+async function tryJudgeRound(data, pIds) {
+    if (isJudging) return;
+    if (data.status !== 'playing') return;
+    if (pIds.length !== 2) return;
+
+    const bothSubmitted = pIds.every(id => hasSubmitted(data.players[id]));
+    if (!bothSubmitted) return;
+
+    isJudging = true;
+
+    try {
+        const statusRef = ref(db, `${DB_ROOT}/${currentRoom}/status`);
+        const txResult = await runTransaction(statusRef, status => {
+            if (status === 'playing') return 'judging';
+            return;
+        });
+
+        if (txResult.committed && txResult.snapshot.val() === 'judging') {
+            await judgeRound(data.players, pIds);
         }
+    } catch (error) {
+        console.error("라운드 판정 중 에러:", error);
+        await update(ref(db, `${DB_ROOT}/${currentRoom}`), { status: 'playing' });
+    } finally {
+        isJudging = false;
     }
 }
 
 // 4. 승패 판정 로직 (1은 9를 이긴다)
 async function judgeRound(players, pIds) {
-    const p1Num = players[pIds[0]].submittedTile;
-    const p2Num = players[pIds[1]].submittedTile;
-    let winnerId = null;
+    const p1Num = Number(players[pIds[0]].submittedTile || 0);
+    const p2Num = Number(players[pIds[1]].submittedTile || 0);
+    let winnerId = 'draw';
 
     if (p1Num === p2Num) {
-        // 무승부
+        winnerId = 'draw';
     } else if (p1Num === 1 && p2Num === 9) {
         winnerId = pIds[0];
     } else if (p1Num === 9 && p2Num === 1) {
@@ -159,15 +266,29 @@ async function judgeRound(players, pIds) {
     const p2Score = players[pIds[1]].score || 0;
     const newP1Score = winnerId === pIds[0] ? p1Score + 1 : p1Score;
     const newP2Score = winnerId === pIds[1] ? p2Score + 1 : p2Score;
+    const allTilesUsed = pIds.every(id => getUsedTileCount(players[id]) >= 9);
     
     let nextStatus = 'result';
+    let gameWinner = '';
+
     if (newP1Score >= 5 || newP2Score >= 5) {
-        nextStatus = 'finished'; 
+        nextStatus = 'finished';
+        gameWinner = newP1Score > newP2Score ? pIds[0] : pIds[1];
+    } else if (allTilesUsed) {
+        nextStatus = 'finished';
+        if (newP1Score > newP2Score) {
+            gameWinner = pIds[0];
+        } else if (newP2Score > newP1Score) {
+            gameWinner = pIds[1];
+        } else {
+            gameWinner = 'draw';
+        }
     }
 
     const updates = {};
     updates[`${DB_ROOT}/${currentRoom}/status`] = nextStatus;
     updates[`${DB_ROOT}/${currentRoom}/lastWinner`] = winnerId;
+    updates[`${DB_ROOT}/${currentRoom}/gameWinner`] = gameWinner;
     updates[`${DB_ROOT}/${currentRoom}/tileP1`] = p1Num;
     updates[`${DB_ROOT}/${currentRoom}/tileP2`] = p2Num;
     updates[`${DB_ROOT}/${currentRoom}/p1Id`] = pIds[0];
@@ -179,37 +300,65 @@ async function judgeRound(players, pIds) {
 }
 
 // 5. 다음 라운드 준비 버튼
-document.getElementById('ready-btn').onclick = async () => {
-    document.getElementById('ready-btn').classList.add('hidden');
-    document.getElementById('round-result').innerText = '';
-    
-    document.getElementById('my-played-tile').className = 'tile unknown';
-    document.getElementById('my-played-tile').innerText = '?';
-    document.getElementById('enemy-tile').className = 'tile unknown';
-    document.getElementById('enemy-tile').innerText = '?';
-    mySubmittedNumber = null;
+async function tryStartNextRound(data, pIds) {
+    if (isStartingNextRound) return;
+    if (data.status !== 'result') return;
+    if (pIds.length !== 2) return;
 
-    await update(ref(db, `${DB_ROOT}/${currentRoom}/players/${myUid}`), {
-        isReady: true,
-        submittedTile: null
-    });
+    const bothReady = pIds.every(id => data.players[id] && data.players[id].isReady === true);
+    if (!bothReady) return;
 
-    checkNextRoundStart();
-};
+    isStartingNextRound = true;
 
-async function checkNextRoundStart() {
-    const snapshot = await get(ref(db, `${DB_ROOT}/${currentRoom}/players`));
-    const players = snapshot.val();
-    const pIds = Object.keys(players);
-    
-    if (pIds.every(id => players[id].isReady)) {
-        if (pIds[0] === myUid) {
-            await update(ref(db, `${DB_ROOT}/${currentRoom}`), { status: 'playing' });
-            await update(ref(db, `${DB_ROOT}/${currentRoom}/players/${pIds[0]}`), { isReady: false });
-            await update(ref(db, `${DB_ROOT}/${currentRoom}/players/${pIds[1]}`), { isReady: false });
+    try {
+        const statusRef = ref(db, `${DB_ROOT}/${currentRoom}/status`);
+        const txResult = await runTransaction(statusRef, status => {
+            if (status === 'result') return 'starting';
+            return;
+        });
+
+        if (txResult.committed && txResult.snapshot.val() === 'starting') {
+            const updates = {};
+            updates[`${DB_ROOT}/${currentRoom}/status`] = 'playing';
+            updates[`${DB_ROOT}/${currentRoom}/lastWinner`] = '';
+            updates[`${DB_ROOT}/${currentRoom}/gameWinner`] = '';
+            updates[`${DB_ROOT}/${currentRoom}/tileP1`] = 0;
+            updates[`${DB_ROOT}/${currentRoom}/tileP2`] = 0;
+            updates[`${DB_ROOT}/${currentRoom}/p1Id`] = '';
+            updates[`${DB_ROOT}/${currentRoom}/p2Id`] = '';
+
+            pIds.forEach(id => {
+                updates[`${DB_ROOT}/${currentRoom}/players/${id}/isReady`] = false;
+                updates[`${DB_ROOT}/${currentRoom}/players/${id}/submittedTile`] = 0;
+            });
+
+            await update(ref(db), updates);
         }
+    } catch (error) {
+        console.error("다음 라운드 시작 중 에러:", error);
+        await update(ref(db, `${DB_ROOT}/${currentRoom}`), { status: 'result' });
+    } finally {
+        isStartingNextRound = false;
     }
 }
+
+document.getElementById('ready-btn').onclick = async () => {
+    if (currentStatus !== 'result') return;
+
+    document.getElementById('ready-btn').classList.add('hidden');
+    document.getElementById('game-info').innerText = "상대방의 준비를 기다리는 중...";
+
+    try {
+        await update(ref(db, `${DB_ROOT}/${currentRoom}/players/${myUid}`), {
+            isReady: true,
+            submittedTile: 0
+        });
+    } catch (error) {
+        console.error("준비 처리 실패:", error);
+        alert("준비 처리에 실패했습니다. 다시 시도하세요.");
+        document.getElementById('ready-btn').classList.remove('hidden');
+    }
+};
 
 // 6. 실시간 동기화 (화면 표시)
 function listenToRoom() {
@@ -220,84 +369,139 @@ function listenToRoom() {
             return;
         }
 
+        latestRoomData = data;
+        currentStatus = data.status || 'setup';
+
         const info = document.getElementById('game-info');
         const enemyEl = document.getElementById('enemy-tile');
+        const myPlayedEl = document.getElementById('my-played-tile');
+        const readyBtn = document.getElementById('ready-btn');
+        const resEl = document.getElementById('round-result');
         const pIds = data.players ? Object.keys(data.players) : [];
+        const myPlayer = data.players ? data.players[myUid] : null;
         const enemyId = pIds.find(id => id !== myUid);
+        const enemyPlayer = enemyId && data.players ? data.players[enemyId] : null;
 
-        // 6-1. 대기 중
-        if (data.status === 'setup') {
+        if (myPlayer) {
+            myScore = myPlayer.score || 0;
+            mySubmittedNumber = Number(myPlayer.submittedTile || 0);
+            document.getElementById('my-score').innerText = myScore;
+            syncDeckUsedTiles(myPlayer);
+        }
+
+        if (currentStatus === 'setup') {
+            readyBtn.classList.add('hidden');
+            resEl.innerText = '';
+            renderTile(myPlayedEl, 0);
+            renderTile(enemyEl, 0);
+
             if (pIds.length < 2) {
                 info.innerText = "상대방의 입장을 기다리는 중...";
             } else {
-                const enemyName = data.players[enemyId].nickname;
-                info.innerText = `${enemyName}님이 입장했습니다! 타일을 내세요.`;
-            }
-        } 
-        // 6-2. 진행 중
-        else if (data.status === 'playing') {
-            if (mySubmittedNumber === null) {
-                info.innerText = "이번 라운드에 낼 타일을 선택하세요.";
-            } else {
-                info.innerText = "상대방을 기다리는 중...";
-            }
-            
-            if (enemyId && data.players[enemyId].submittedTile !== null) {
-                const enemyNum = data.players[enemyId].submittedTile;
-                enemyEl.className = `tile ${enemyNum % 2 === 0 ? 'black' : 'white'}`;
-                enemyEl.innerText = '?';
-            } else {
-                enemyEl.className = 'tile unknown';
-                enemyEl.innerText = '?';
+                info.innerText = "상대방이 입장했습니다. 게임을 시작하는 중...";
             }
         }
-        // 6-3. 결과 판정 및 최종 종료
-        else if (data.status === 'result' || data.status === 'finished') {
-            const enemyNum = (data.p1Id === enemyId) ? data.tileP1 : data.tileP2;
-            enemyEl.className = `tile ${enemyNum % 2 === 0 ? 'black' : 'white'}`;
-            enemyEl.innerText = enemyNum;
-            
-            myScore = data.players[myUid].score || 0;
+        else if (currentStatus === 'playing') {
+            readyBtn.classList.add('hidden');
+            resEl.innerText = '';
+
+            if (mySubmittedNumber > 0) {
+                renderTile(myPlayedEl, mySubmittedNumber);
+                info.innerText = "상대방의 선택을 기다리는 중...";
+            } else {
+                renderTile(myPlayedEl, 0);
+                info.innerText = "이번 라운드에 낼 타일을 선택하세요.";
+            }
+
+            const enemyNum = Number(enemyPlayer && enemyPlayer.submittedTile ? enemyPlayer.submittedTile : 0);
+            renderTile(enemyEl, enemyNum, true);
+        }
+        else if (currentStatus === 'judging') {
+            readyBtn.classList.add('hidden');
+            info.innerText = "결과 판정 중...";
+
+            if (mySubmittedNumber > 0) {
+                renderTile(myPlayedEl, mySubmittedNumber);
+            }
+
+            const enemyNum = Number(enemyPlayer && enemyPlayer.submittedTile ? enemyPlayer.submittedTile : 0);
+            renderTile(enemyEl, enemyNum, true);
+        }
+        else if (currentStatus === 'starting') {
+            readyBtn.classList.add('hidden');
+            info.innerText = "다음 라운드를 준비하는 중...";
+        }
+        else if (currentStatus === 'result' || currentStatus === 'finished') {
+            let myRoundNum = 0;
+            let enemyRoundNum = 0;
+
+            if (data.p1Id === myUid) myRoundNum = data.tileP1;
+            if (data.p2Id === myUid) myRoundNum = data.tileP2;
+            if (data.p1Id === enemyId) enemyRoundNum = data.tileP1;
+            if (data.p2Id === enemyId) enemyRoundNum = data.tileP2;
+
+            renderTile(myPlayedEl, myRoundNum);
+            renderTile(enemyEl, enemyRoundNum);
             document.getElementById('my-score').innerText = myScore;
 
-            const resEl = document.getElementById('round-result');
+            const effectKey = `${data.p1Id || ''}-${data.p2Id || ''}-${data.tileP1 || 0}-${data.tileP2 || 0}-${data.lastWinner || ''}`;
+            const shouldPlayEffect = lastEffectKey !== effectKey;
+            if (shouldPlayEffect) lastEffectKey = effectKey;
             
             if (data.lastWinner === myUid) {
                 resEl.innerText = "🎉 이번 라운드 승리!";
                 resEl.className = "round-result-msg win-text";
-                document.body.classList.add('hit-flash');
-                setTimeout(() => document.body.classList.remove('hit-flash'), 200);
-                if (navigator.vibrate) navigator.vibrate([100, 50, 100]);
-            } else if (data.lastWinner === null) {
+                if (shouldPlayEffect) {
+                    document.body.classList.add('hit-flash');
+                    setTimeout(() => document.body.classList.remove('hit-flash'), 200);
+                    if (navigator.vibrate) navigator.vibrate([100, 50, 100]);
+                }
+            } else if (data.lastWinner === 'draw') {
                 resEl.innerText = "🤝 무승부!";
                 resEl.className = "round-result-msg draw-text";
             } else {
                 resEl.innerText = "💥 이번 라운드 패배...";
                 resEl.className = "round-result-msg lose-text";
-                document.body.classList.add('screen-shake');
-                setTimeout(() => document.body.classList.remove('screen-shake'), 400);
-                if (navigator.vibrate) navigator.vibrate(300);
+                if (shouldPlayEffect) {
+                    document.body.classList.add('screen-shake');
+                    setTimeout(() => document.body.classList.remove('screen-shake'), 400);
+                    if (navigator.vibrate) navigator.vibrate(300);
+                }
             }
 
-            // 5점 도달 시 최종 방폭 처리
-            if (data.status === 'finished') {
-                if (data.lastWinner === myUid) {
+            if (currentStatus === 'finished') {
+                const gameWinner = data.gameWinner || data.lastWinner;
+
+                if (gameWinner === myUid) {
                     info.innerText = "🏆 최종 승리!!! (5초 뒤 대기실 이동)";
+                } else if (gameWinner === 'draw') {
+                    info.innerText = "🤝 최종 무승부! (5초 뒤 대기실 이동)";
                 } else {
                     info.innerText = "💀 최종 패배... (5초 뒤 대기실 이동)";
                 }
-                document.getElementById('ready-btn').classList.add('hidden');
+
+                readyBtn.classList.add('hidden');
                 
-                if (data.lastWinner === myUid) {
+                if (!finishHandled) {
+                    finishHandled = true;
                     setTimeout(() => {
                         remove(ref(db, `${DB_ROOT}/${currentRoom}`));
                     }, 5000);
                 }
             } else {
-                info.innerText = "결과 공개!";
-                document.getElementById('ready-btn').classList.remove('hidden');
+                if (myPlayer && myPlayer.isReady) {
+                    info.innerText = "준비 완료. 상대방의 준비를 기다리는 중...";
+                    readyBtn.classList.add('hidden');
+                } else {
+                    info.innerText = "결과 공개!";
+                    readyBtn.classList.remove('hidden');
+                }
             }
         }
+
+        tryStartFirstRound(data, pIds).catch(console.error);
+        tryJudgeRound(data, pIds).catch(console.error);
+        tryStartNextRound(data, pIds).catch(console.error);
     });
 }
 
