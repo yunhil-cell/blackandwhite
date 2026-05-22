@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>구룡투 (흑과 백)</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+    <div id="auth-screen">
+        <div class="main-logo">☯️</div>
+        <h1 style="margin-bottom: 5px;">구룡투 : 흑과 백</h1>
+        <p class="subtitle">1부터 9까지, 치열한 심리전</p>
+
+        <div class="login-box">
+            <input type="text" id="nickname" placeholder="팀명 (예: 1조)" autocomplete="off">
+            <div class="room-controls">
+                <button id="create-room-btn" class="action-btn create-btn">새 결투장 만들기</button>
+                <div class="join-box">
+                    <input type="number" id="join-code" placeholder="입장 코드 4자리" autocomplete="off">
+                    <button id="join-room-btn" class="action-btn join-btn">입장하기</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="admin-reset-area">
+            <p class="notice">교사용 관리 메뉴</p>
+            <input type="password" id="global-reset-pw" placeholder="초기화 암호">
+            <button id="global-reset-btn" class="admin-btn">모든 결투장 초기화</button>
+        </div>
+    </div>
+
+    <div id="game-screen" class="hidden">
+        <div class="status-bar">
+            <div>
+                <span class="room-badge" id="display-room"></span>
+                <span id="display-name"></span>
+            </div>
+            <div id="score-board">내 승점: <span id="my-score">0</span> / 5</div>
+        </div>
+
+        <div id="game-info">상대방을 기다리는 중...</div>
+
+        <div class="battle-arena">
+            <div class="enemy-area">
+                <p>상대방이 낸 타일</p>
+                <div id="enemy-tile" class="tile unknown">?</div>
+            </div>
+            <div class="vs-text">VS</div>
+            <div class="my-area">
+                <p>내가 낸 타일</p>
+                <div id="my-played-tile" class="tile unknown">?</div>
+            </div>
+        </div>
+
+        <div class="round-result-msg" id="round-result"></div>
+
+        <div class="my-deck-container">
+            <h3>나의 타일 (클릭하여 제출)</h3>
+            <div id="my-deck" class="deck-grid">
+                </div>
+        </div>
+        
+        <button id="ready-btn" class="hidden">다음 라운드 준비</button>
+    </div>
+
+    <script type="module" src="script.js"></script>
+</body>
+</html>
